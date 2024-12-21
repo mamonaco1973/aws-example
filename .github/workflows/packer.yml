@@ -1,0 +1,60 @@
+name: Build Flask AMI with Packer # The name of the pipeline, indicating its purpose to build a Flask AMI using Packer.
+
+on:
+  workflow_dispatch: # Specifies that the pipeline can only be triggered manually, allowing controlled execution.
+
+jobs:
+  validate: # A single job in the pipeline, responsible for validating and building the AMI.
+    runs-on: ubuntu-latest # Specifies that the job will execute on the latest Ubuntu GitHub runner.
+
+    steps: # Steps within the job to perform specific tasks.
+
+      - name: Checkout Code # Fetches the source code from the repository.
+        uses: actions/checkout@v3 # Utilizes the official GitHub action to pull the repository contents.
+
+      - name: Set Environment Variables # Configures AWS credentials and region for subsequent operations.
+        run: |
+          echo "AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}" >> $GITHUB_ENV # Sets the AWS access key as an environment variable.
+          echo "AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}" >> $GITHUB_ENV # Sets the AWS secret access key as an environment variable.
+          echo "AWS_DEFAULT_REGION=${{ secrets.AWS_REGION }}" >> $GITHUB_ENV # Sets the AWS default region as an environment variable.
+
+      - name: Setup Packer # Installs and configures Packer for AMI creation.
+        uses: hashicorp/setup-packer@v2 # Uses the official HashiCorp action to install Packer.
+
+      - name: Packer Validate # Validates the Packer configuration to ensure correctness before building.
+        run: |
+          cd ./02-packer # Navigate to the directory containing the Packer files.
+          packer init . # Initializes Packer by setting up plugins and dependencies.
+          packer validate ./flask_ami.pkr.hcl # Validates the specified Packer configuration file for syntax and logic errors.
+
+      - name: Packer Run # Builds the AMI using Packer with dynamic inputs for the VPC and Subnet IDs.
+        run: |
+          cd ./02-packer # Navigate to the directory containing the Packer files.
+
+          # Dynamically fetch the VPC ID tagged as "challenge-vpc."
+          vpc_id=$(aws ec2 describe-vpcs \
+            --filters "Name=tag:Name,Values=challenge-vpc" \
+            --query "Vpcs[0].VpcId" \
+            --output text)
+
+          # Dynamically fetch the Subnet ID tagged as "challenge-subnet-1."
+          subnet_id=$(aws ec2 describe-subnets \
+            --filters "Name=tag:Name,Values=challenge-subnet-1" \
+            --query "Subnets[0].SubnetId" \
+            --output text)
+
+          # Error handling: Ensure VPC ID and Subnet ID are not empty or invalid.
+          if [ "$vpc_id" == "None" ] || [ "$subnet_id" == "None" ]; then
+            echo "ERROR: Either VPC ID or Subnet ID is empty." # Logs an error message for missing IDs.
+            echo "ERROR: It would appear the infrastructure has not been built yet." # Suggests the likely issue.
+            exit 1 # Terminates the script with an error status.
+          fi
+
+          # Initialize Packer configuration specific to the AMI build.
+          packer init ./flask_ami.pkr.hcl
+
+          # Build the AMI using the validated Packer configuration, passing dynamic VPC and Subnet IDs.
+          packer build -var "vpc_id=$vpc_id" -var "subnet_id=$subnet_id" ./flask_ami.pkr.hcl || { 
+            echo "NOTE: Packer build failed. Aborting."; # Logs a failure message if the build fails.
+            exit 1; # Terminates the script with an error status.
+          }

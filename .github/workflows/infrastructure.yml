@@ -1,0 +1,67 @@
+name: Build Infrastructure # Pipeline name, indicating it builds the required infrastructure.
+
+on:
+  workflow_dispatch: # Currently, the pipeline can only be triggered manually.
+
+jobs:
+  validate: # The first job, responsible for validating the Terraform configuration before deployment.
+    runs-on: ubuntu-latest # Specifies the job runs on the latest Ubuntu runner.
+
+    steps: # Each step defines a task within the validation process.
+
+      - name: Checkout Code # Fetches the repository's code.
+        uses: actions/checkout@v3 # Uses GitHub's official action to pull the code.
+
+      - name: Set Environment Variables # Sets AWS credentials for Terraform.
+        run: |
+          echo "AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}" >> $GITHUB_ENV # Sets the AWS access key from secrets as an environment variable.
+          echo "AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}" >> $GITHUB_ENV # Sets the AWS secret key from secrets as an environment variable.
+          echo "AWS_DEFAULT_REGION=${{ secrets.AWS_REGION }}" >> $GITHUB_ENV # Sets the AWS region from secrets as an environment variable.
+
+      - name: Setup Terraform # Installs the specified version of Terraform.
+        uses: hashicorp/setup-terraform@v2 # Uses the official HashiCorp action for Terraform setup.
+
+      - name: Terraform Validate # Validates the Terraform configuration for correctness.
+        run: |
+          cd ./01-infrastructure # Navigate to the Terraform directory containing the configuration files.
+          terraform init # Initializes Terraform by downloading necessary plugins and providers.
+          terraform validate # Validates the configuration for syntax and semantic errors.
+
+      - name: Terraform Plan # Generates a plan to preview changes Terraform will make to the infrastructure.
+        run: |
+          cd ./01-infrastructure # Navigate to the Terraform directory.
+          terraform plan # Creates a detailed plan of proposed infrastructure changes.
+
+  apply: # The second job, which applies the validated Terraform configuration to build the infrastructure.
+    needs: validate # Ensures this job runs only if the "validate" job completes successfully.
+    runs-on: ubuntu-latest # Specifies the job runs on the latest Ubuntu runner.
+
+    steps: # Steps define the tasks involved in the deployment process.
+
+      - name: Checkout Code # Fetches the repository's code.
+        uses: actions/checkout@v3 # Uses GitHub's official action to pull the code.
+
+      - name: Set Environment Variables # Sets AWS credentials for Terraform.
+        run: |
+          echo "AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}" >> $GITHUB_ENV # Sets the AWS access key from secrets as an environment variable.
+          echo "AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}" >> $GITHUB_ENV # Sets the AWS secret key from secrets as an environment variable.
+          echo "AWS_DEFAULT_REGION=${{ secrets.AWS_REGION }}" >> $GITHUB_ENV # Sets the AWS region from secrets as an environment variable.
+
+      - name: Build Infrastructure and AMI # Deploys the infrastructure using Terraform.
+        run: |
+          echo "Deploying infrastructure..." # Logs the start of the deployment process.
+          cd 01-infrastructure # Navigate to the Terraform configuration directory.
+          terraform init # Re-initializes Terraform in case the previous job ran in a different context.
+          
+          # Fetch the latest available AMI ID
+          ami_id=$(aws ec2 describe-images --filters "Name=name,Values=flask_server_ami*" "Name=state,Values=available" --query "Images | sort_by(@, &CreationDate) | [-1].ImageId" --output text) 
+
+          # Check if an AMI ID was found
+          
+          if [ "$ami_id" == "None" ]; then
+              echo "WARNING: No Flask AMI found. Executing Terraform without specifying an AMI."
+              terraform apply -var="asg_instances=2" -auto-approve
+          else
+              echo "NOTE: Flask AMI found: $ami_id. Executing Terraform with the flask AMI."
+              terraform apply -var="default_ami=$ami_id" -var="asg_instances=2" -auto-approve
+          fi

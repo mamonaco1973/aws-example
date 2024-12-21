@@ -1,0 +1,110 @@
+name: Destroy Solution # The name of the pipeline, indicating its purpose to destroy infrastructure.
+
+on:
+  workflow_dispatch: # This pipeline can only be triggered manually, ensuring no accidental execution.
+
+jobs:
+  phase_0: # The job that handles the destruction of infrastructure.
+    runs-on: ubuntu-latest # Specifies the job runs on the latest version of the Ubuntu runner.
+    name:  Destroy ECS/Lambda
+    steps: # Steps define the individual tasks performed in the job.
+
+      - name: Checkout Code # Step to pull the repository code.
+        uses: actions/checkout@v3 # Uses the official GitHub checkout action to fetch the repository contents.
+
+      - name: Set Environment Variables # Configures AWS credentials required for Terraform operations.
+        run: |
+          echo "AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}" >> $GITHUB_ENV # Exposes the AWS access key from GitHub secrets as an environment variable.
+          echo "AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}" >> $GITHUB_ENV # Exposes the AWS secret key from GitHub secrets as an environment variable.
+          echo "AWS_DEFAULT_REGION=${{ secrets.AWS_REGION }}" >> $GITHUB_ENV # Sets the default AWS region for all AWS CLI and SDK operations.
+
+      - name: Setup Terraform # Installs the required version of Terraform for managing infrastructure.
+        uses: hashicorp/setup-terraform@v2 # Utilizes the official HashiCorp action to install Terraform.
+        
+      - name: Destroy ECS/Lambda # Executes the destruction of all resources managed by Terraform.
+        run: |    
+          cd 04-ecs
+          terraform init
+          terraform destroy -auto-approve
+          cd ..
+          cd 05-lambda
+          terraform init
+          terraform destroy -auto-approve
+  phase_1: 
+    runs-on: ubuntu-latest # Specifies the job runs on the latest version of the Ubuntu runner.
+    needs: phase_0
+    name:  Destroy ECR
+    steps: # Steps define the individual tasks performed in the job.
+
+      - name: Checkout Code # Step to pull the repository code.
+        uses: actions/checkout@v3 # Uses the official GitHub checkout action to fetch the repository contents.
+
+      - name: Set Environment Variables # Configures AWS credentials required for Terraform operations.
+        run: |
+          echo "AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}" >> $GITHUB_ENV # Exposes the AWS access key from GitHub secrets as an environment variable.
+          echo "AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}" >> $GITHUB_ENV # Exposes the AWS secret key from GitHub secrets as an environment variable.
+          echo "AWS_DEFAULT_REGION=${{ secrets.AWS_REGION }}" >> $GITHUB_ENV # Sets the default AWS region for all AWS CLI and SDK operations.
+
+      - name: Delete ECR # Executes the destruction of all resources managed by Terraform.
+        run: |
+          ECR_REPOSITORY_NAME="flask-app"
+          aws ecr delete-repository --repository-name $ECR_REPOSITORY_NAME --force || true
+
+  phase_2: 
+    runs-on: ubuntu-latest # Specifies the job runs on the latest version of the Ubuntu runner.
+    needs: phase_1
+    name:  Delete AMIs
+    steps: # Steps define the individual tasks performed in the job.
+
+      - name: Checkout Code # Step to pull the repository code.
+        uses: actions/checkout@v3 # Uses the official GitHub checkout action to fetch the repository contents.
+
+      - name: Set Environment Variables # Configures AWS credentials required for Terraform operations.
+        run: |
+          echo "AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}" >> $GITHUB_ENV # Exposes the AWS access key from GitHub secrets as an environment variable.
+          echo "AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}" >> $GITHUB_ENV # Exposes the AWS secret key from GitHub secrets as an environment variable.
+          echo "AWS_DEFAULT_REGION=${{ secrets.AWS_REGION }}" >> $GITHUB_ENV # Sets the default AWS region for all AWS CLI and SDK operations.
+
+      - name: Delete AMIs # Deletes AMIs and associated snapshot
+        run: |
+        
+          # Fetch AMIs with names starting with "flask_server_ami"
+          for ami_id in $(aws ec2 describe-images \
+              --owners self \
+              --filters "Name=name,Values=flask_server_ami*" \
+              --query "Images[].ImageId" \
+              --output text); do
+
+              # Fetch and delete associated snapshots
+              for snapshot_id in $(aws ec2 describe-images \
+                  --image-ids $ami_id \
+                  --query "Images[].BlockDeviceMappings[].Ebs.SnapshotId" \
+                  --output text); do
+                  echo "Deregistering AMI: $ami_id"
+                  aws ec2 deregister-image --image-id $ami_id
+                  echo "Deleting snapshot: $snapshot_id"
+                  aws ec2 delete-snapshot --snapshot-id $snapshot_id
+              done
+            done
+
+  phase_3: 
+    runs-on: ubuntu-latest # Specifies the job runs on the latest version of the Ubuntu runner.
+    needs: phase_2
+    name:  Destroy Infrastucture
+    steps: # Steps define the individual tasks performed in the job.
+
+      - name: Checkout Code # Step to pull the repository code.
+        uses: actions/checkout@v3 # Uses the official GitHub checkout action to fetch the repository contents.
+
+      - name: Set Environment Variables # Configures AWS credentials required for Terraform operations.
+        run: |
+          echo "AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}" >> $GITHUB_ENV # Exposes the AWS access key from GitHub secrets as an environment variable.
+          echo "AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}" >> $GITHUB_ENV # Exposes the AWS secret key from GitHub secrets as an environment variable.
+          echo "AWS_DEFAULT_REGION=${{ secrets.AWS_REGION }}" >> $GITHUB_ENV # Sets the default AWS region for all AWS CLI and SDK operations.
+
+      - name: Destroy Infrastructure # Executes the destruction of all resources managed by Terraform.
+        run: |
+          cd 01-infrastructure
+          terraform init
+          terraform destroy -auto-approve
+          cd ..

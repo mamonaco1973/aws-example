@@ -1,0 +1,368 @@
+name: Combined CI/CD Pipeline
+
+on:
+  # Uncomment the following lines to enable automatic pipeline execution when code is pushed to the "main" branch.
+  # push:
+  #   branches:
+  #     - main
+  workflow_dispatch:
+
+jobs:
+  validate: # This job is responsible for validating Terraform and Packer configurations.
+    name: Validate Code
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Set Environment Variables
+        run: |
+          echo "AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}" >> $GITHUB_ENV
+          echo "AWS_DEFAULT_REGION=${{ secrets.AWS_REGION }}" >> $GITHUB_ENV
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+
+      - name: Terraform Validate
+        run: |
+          cd ./01-infrastructure
+          terraform init
+          terraform validate
+          cd ..
+          cd ./04-ecs
+          terraform init
+          terraform validate
+
+      - name: Terraform Plan
+        run: |
+          cd ./01-infrastructure
+          terraform plan
+
+      - name: Setup Packer
+        uses: hashicorp/setup-packer@v2
+
+      - name: Packer Validate
+        run: |
+          cd ./02-packer
+          packer init .
+          packer validate ./flask_ami.pkr.hcl
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+        with:
+          install: true
+
+  deploy_phase_1:
+    name: Deploy Infrastructure
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Set Environment Variables
+        run: |
+          echo "AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}" >> $GITHUB_ENV
+          echo "AWS_DEFAULT_REGION=${{ secrets.AWS_REGION }}" >> $GITHUB_ENV
+
+      - name: Deploy Infrastructure
+        run: |
+          aws ecs delete-service --cluster ecs-cluster --service flask-service --force  > /dev/null 2> /dev/null || true
+
+          cd 01-infrastructure
+          terraform init
+
+          # Fetch the latest available AMI ID
+          
+          ami_id=$(aws ec2 describe-images --filters "Name=name,Values=flask_server_ami*" "Name=state,Values=available" --query "Images | sort_by(@, &CreationDate) | [-1].ImageId" --output text) 
+
+          # Check if an AMI ID was found
+          
+          if [ "$ami_id" == "None" ]; then
+              echo "WARNING: No Flask AMI found. Executing Terraform without specifying an AMI."
+              terraform apply -var="asg_instances=0" -auto-approve
+          else
+              echo "NOTE: Flask AMI found: $ami_id. Executing Terraform with the flask AMI."
+              terraform apply -var="default_ami=$ami_id" -var="asg_instances=0" -auto-approve
+          fi
+          
+  deploy_phase_2:
+    name: Build AMI
+    needs: deploy_phase_1
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Set Environment Variables
+        run: |
+          echo "AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}" >> $GITHUB_ENV
+          echo "AWS_DEFAULT_REGION=${{ secrets.AWS_REGION }}" >> $GITHUB_ENV
+
+      - name: Build AMI
+        run: |
+         cd 02-packer
+         echo "NOTE: Building AMI with packer."
+         vpc_id=$(aws ec2 describe-vpcs --filters "Name=tag:Name,Values=challenge-vpc" --query "Vpcs[0].VpcId" --output text)
+         subnet_id=$(aws ec2 describe-subnets --filters "Name=tag:Name,Values=challenge-subnet-1" --query "Subnets[0].SubnetId" --output text)
+         packer init ./flask_ami.pkr.hcl
+         packer build -var "vpc_id=$vpc_id" -var "subnet_id=$subnet_id" ./flask_ami.pkr.hcl || { echo "NOTE: Packer build failed. Aborting."; exit 1; }
+
+  deploy_phase_3:
+    name: Apply AMI
+    needs: deploy_phase_2
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Set Environment Variables
+        run: |
+          echo "AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}" >> $GITHUB_ENV
+          echo "AWS_DEFAULT_REGION=${{ secrets.AWS_REGION }}" >> $GITHUB_ENV
+
+      - name: Apply AMI
+        run: |
+         cd 01-infrastructure
+         ami_id=$(aws ec2 describe-images --filters "Name=name,Values=flask_server_ami*" "Name=state,Values=available" --query "Images | sort_by(@, &CreationDate) | [-1].ImageId" --output text) 
+         echo $ami_id
+         echo "NOTE: Building infrastructure phase 3."
+         terraform init
+         terraform apply -var="default_ami=$ami_id" -var="asg_instances=2" -auto-approve
+
+  deploy_phase_4:
+    name: Build and Publish Docker Image
+    needs: deploy_phase_3
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Set Environment Variables
+        run: |
+          echo "AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}" >> $GITHUB_ENV
+          echo "AWS_DEFAULT_REGION=${{ secrets.AWS_REGION }}" >> $GITHUB_ENV
+
+      - name: Build and Publish Docker Image
+        run: |
+          cd 03-docker
+          echo "NOTE: Building flask container with Docker."
+
+          # Retrieve the AWS Account ID using the AWS CLI.
+          AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query "Account" --output text)
+
+          # Authenticate Docker to AWS ECR using the retrieved credentials.
+          aws ecr get-login-password --region us-east-2 | docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.us-east-2.amazonaws.com
+
+          # Build and push the Docker image.
+          # The image tag includes the AWS Account ID and the specified repository and tag.
+
+          docker build -t ${AWS_ACCOUNT_ID}.dkr.ecr.us-east-2.amazonaws.com/flask-app:flask-app-rc1 . --push
+
+  deploy_phase_5:
+    name: Deploy ECS
+    needs: deploy_phase_4
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Set Environment Variables
+        run: |
+          echo "AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}" >> $GITHUB_ENV
+          echo "AWS_DEFAULT_REGION=${{ secrets.AWS_REGION }}" >> $GITHUB_ENV
+
+      - name: Deploy ECS
+        run: |
+          echo "NOTE: Stopping existing service if running."
+          aws ecs delete-service --cluster ecs-cluster --service flask-service --force  > /dev/null 2> /dev/null || true
+          aws ecs wait services-inactive --cluster ecs-cluster --services flask-service > /dev/null 2> /dev/null || true
+          cd 04-ecs
+          echo "NOTE: Building ecs infrastructure phase 5."
+          terraform init
+          terraform apply -auto-approve
+
+  deploy_phase_6:
+    name: Deploy API Gateway/Lambda
+    needs: deploy_phase_5
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Set Environment Variables
+        run: |
+          echo "AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}" >> $GITHUB_ENV
+          echo "AWS_DEFAULT_REGION=${{ secrets.AWS_REGION }}" >> $GITHUB_ENV
+
+      - name: Deploy API Gateway/Lambda
+        run: |
+          cd 05-lambda
+          echo "NOTE: Zipping lambda code into lambda.zip"
+          cd code
+          rm -f -r lambdas.zip
+          zip lambdas.zip *.py
+          cd ..
+          echo "NOTE: Building API Gateway/Lambda infrastructure phase 6."
+          terraform init
+          terraform apply -auto-approve
+
+  test_1:
+    name: Test EC2 Solution
+    needs: deploy_phase_6
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Set Environment Variables
+        run: |
+          echo "AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}" >> $GITHUB_ENV
+          echo "AWS_DEFAULT_REGION=${{ secrets.AWS_REGION }}" >> $GITHUB_ENV
+
+      - name: Test EC2 Solution
+        run: |
+            TARGET_GROUP_NAME="challenge-alb-tg"
+            MAX_WAIT_TIME=300 # 5 minutes in seconds
+            INTERVAL=10       # Check every 10 seconds
+
+            # Fetch the Target Group ARN
+            TARGET_GROUP_ARN=$(aws elbv2 describe-target-groups --names "$TARGET_GROUP_NAME" --query 'TargetGroups[0].TargetGroupArn' --output text)
+
+            if [ -z "$TARGET_GROUP_ARN" ]; then
+              echo "ERROR: Target group $TARGET_GROUP_NAME not found."
+              exit 1
+            fi
+            # Start checking for healthy targets
+            START_TIME=$(date +%s)
+
+            echo "NOTE: Checking for healthy targets in target group $TARGET_GROUP_NAME."
+
+            while true; do
+                # Check for healthy targets
+                HEALTHY_TARGETS=$(aws elbv2 describe-target-health --target-group-arn "$TARGET_GROUP_ARN" --query 'TargetHealthDescriptions[?TargetHealth.State==`healthy`].Target.Id' --output text)
+
+              if [ -n "$HEALTHY_TARGETS" ]; then
+                echo "NOTE: Healthy targets found for $TARGET_GROUP_NAME"
+                cd ./02-packer/scripts # Navigate to the test scripts directory.
+                echo "NOTE: Testing the EC2 Solution"
+
+                dns_name=$(aws elbv2 describe-load-balancers --query "LoadBalancers[?LoadBalancerName=='challenge-alb'].DNSName" --output text) 
+                echo "NOTE: URL for EC2 Solution is http://$dns_name/gtg?details=true"
+                ./test_candidates.py $dns_name                                                                                            
+
+                cd ..
+                cd ..
+
+                exit 0
+              fi
+
+              # Check if the maximum wait time has been exceeded
+              CURRENT_TIME=$(date +%s)
+              ELAPSED_TIME=$((CURRENT_TIME - START_TIME))
+
+              if [ "$ELAPSED_TIME" -ge "$MAX_WAIT_TIME" ]; then
+                  echo "ERROR: No healthy targets found within $MAX_WAIT_TIME seconds."
+                  exit 1
+              fi
+
+              # Wait for the interval before checking again
+              sleep "$INTERVAL"
+            done
+  
+  test_2:
+     name: Test ECS Solution
+     needs: test_1
+     runs-on: ubuntu-latest
+     steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Set Environment Variables
+        run: |
+          echo "AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}" >> $GITHUB_ENV
+          echo "AWS_DEFAULT_REGION=${{ secrets.AWS_REGION }}" >> $GITHUB_ENV
+
+      - name: Test ECS Solution
+        run: |
+            TARGET_GROUP_NAME="ecs-tg"
+            MAX_WAIT_TIME=300 # 5 minutes in seconds
+            INTERVAL=10       # Check every 10 seconds
+
+            # Fetch the Target Group ARN
+            TARGET_GROUP_ARN=$(aws elbv2 describe-target-groups --names "$TARGET_GROUP_NAME" --query 'TargetGroups[0].TargetGroupArn' --output text)
+
+            if [ -z "$TARGET_GROUP_ARN" ]; then
+              echo "ERROR: Target group $TARGET_GROUP_NAME not found."
+              exit 1
+            fi
+            # Start checking for healthy targets
+            START_TIME=$(date +%s)
+
+            echo "NOTE: Checking for healthy targets in target group $TARGET_GROUP_NAME."
+
+            while true; do
+                # Check for healthy targets
+                HEALTHY_TARGETS=$(aws elbv2 describe-target-health --target-group-arn "$TARGET_GROUP_ARN" --query 'TargetHealthDescriptions[?TargetHealth.State==`healthy`].Target.Id' --output text)
+
+              if [ -n "$HEALTHY_TARGETS" ]; then
+                echo "NOTE: Healthy targets found for $TARGET_GROUP_NAME"
+                cd ./02-packer/scripts # Navigate to the test scripts directory.
+                echo "NOTE: Testing the ECS Solution"
+
+                dns_name=$(aws elbv2 describe-load-balancers --query "LoadBalancers[?LoadBalancerName=='ecs-alb'].DNSName" --output text) 
+                echo "NOTE: URL for ECS Solution is http://$dns_name/gtg?details=true"
+                ./test_candidates.py $dns_name                                                                                            
+
+                cd ..
+                cd ..
+
+                exit 0
+              fi
+
+              # Check if the maximum wait time has been exceeded
+              CURRENT_TIME=$(date +%s)
+              ELAPSED_TIME=$((CURRENT_TIME - START_TIME))
+
+              if [ "$ELAPSED_TIME" -ge "$MAX_WAIT_TIME" ]; then
+                  echo "ERROR: No healthy targets found within $MAX_WAIT_TIME seconds."
+                  exit 1
+              fi
+
+              # Wait for the interval before checking again
+              sleep "$INTERVAL"
+            done
+            
+  test_3:
+     name: Test API Gateway/Lambda Solution
+     needs: test_2
+     runs-on: ubuntu-latest
+     steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Set Environment Variables
+        run: |
+          echo "AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}" >> $GITHUB_ENV
+          echo "AWS_DEFAULT_REGION=${{ secrets.AWS_REGION }}" >> $GITHUB_ENV
+
+      - name: Test API Gateway/Lambda Solution
+        run: |
+            API_ID=$(aws apigatewayv2 get-apis --query "Items[?Name=='flask-api'].{id:ApiId}" --output text)        
+            SERVICE_URL="https://${API_ID}.execute-api.us-east-2.amazonaws.com"
+            cd ./02-packer/scripts # Navigate to the test scripts directory.
+            echo "NOTE: Testing the API Gateway Solution."
+            echo "NOTE: URL for API Solution is $SERVICE_URL."
+            ./test_candidates.py $SERVICE_URL 
+
+
